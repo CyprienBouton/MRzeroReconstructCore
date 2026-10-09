@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mrzero-reconstruct-core"
+version = "0.1.0"
+description = "Standalone MRzero reconstruction core with GRAPPA, BART bindings, and reconstruction logic."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "torch",
+  "SimpleITK"
+]
+
+[tool.setuptools]
+packages = ["MRzeroReconstructCore", "MRzeroReconstructCore.bart_python", "MRzeroReconstructCore.ggrappa"]
