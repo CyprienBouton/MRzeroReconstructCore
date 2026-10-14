@@ -19,16 +19,12 @@ This project separates reconstruction algorithms from the 3D Slicer interface, m
 project/
 ├── README.md
 ├── pyproject.toml
-├── MRzeroReconstructCore/
+├── MRzeroReconstructCoreLib/
 │   ├── __init__.py
 │   ├── RecoMRzero.py
 │   ├── bart_python/
-│   │   └── __init__.py
 │   └── ggrappa/
-│       └── __init__.py
-└── MRzeroReconstruct/
-    ├── __init__.py
-    └── MRzeroReconstructLogic.py
+└── MRzeroReconstructCore.py
 ```
 
 Adapt this structure to match the actual repository layout.
