@@ -76,10 +76,6 @@ from MRzeroReconstructCore import MRzeroReconstructLogic
 
 The Slicer module logic can import the standalone reconstruction core:
 
-```python
-from MRzeroReconstructCore.RecoMRzero import YourClassName
-```
-
 Keep reconstruction algorithms and supporting utilities in `MRzeroReconstructCore`, and Slicer-specific operations in the Slicer module.
 
 Ensure that the core package and its dependencies are accessible from Slicer's Python environment. Installing the package in your system Python environment does not necessarily make it available in Slicer.
