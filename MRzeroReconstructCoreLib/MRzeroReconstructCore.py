@@ -3,7 +3,7 @@ import torch
 import numpy as np
 import SimpleITK as sitk
 
-from MRzeroReconstructCoreLib.RecoMRzero import RecoMRzero
+from .RecoMRzero import RecoMRzero
 
 
 class MRzeroReconstructLogic:

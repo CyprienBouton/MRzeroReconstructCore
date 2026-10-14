@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "MRzeroReconstructCore"
+name = "mrzero-reconstruct-core"
 version = "0.1.0"
 description = "Standalone MRzero reconstruction core with GRAPPA, BART bindings, and reconstruction logic."
 readme = "README.md"
@@ -15,4 +15,4 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["MRzeroReconstructCoreLib*",  "MRzeroReconstructCore"]
+include = ["MRzeroReconstructCoreLib*"]
