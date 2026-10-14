@@ -12,6 +12,7 @@ dependencies = [
     "numpy",
     "torch",
     "SimpleITK",
+    "mrzerocore",
 ]
 
 [tool.setuptools.packages.find]
