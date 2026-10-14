@@ -15,4 +15,4 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["MRzeroReconstructCoreLib*",  "MRzeroReconstructCore.py"]
+include = ["MRzeroReconstructCoreLib*",  "MRzeroReconstructCore"]
