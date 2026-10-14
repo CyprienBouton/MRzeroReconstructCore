@@ -2,12 +2,8 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 
-try:
-    from . import bart_python  # BART python binding
-    from . import ggrappa
-except ImportError:  # pragma: no cover - fallback for direct script execution
-    import bart_python  # type: ignore
-    import ggrappa  # type: ignore
+from . import bart_python  # BART python binding
+from . import ggrappa
 
 
 def extract_indices_from_kspace_coords(kspace_coords: torch.Tensor, dk: float) -> torch.Tensor:

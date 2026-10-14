@@ -9,10 +9,10 @@ description = "Standalone MRzero reconstruction core with GRAPPA, BART bindings,
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-  "numpy",
-  "torch",
-  "SimpleITK"
+    "numpy",
+    "torch",
+    "SimpleITK",
 ]
 
-[tool.setuptools]
-packages = ["MRzeroReconstructCore", "MRzeroReconstructCore.bart_python", "MRzeroReconstructCore.ggrappa"]
+[tool.setuptools.packages.find]
+include = ["MRzeroReconstructCoreLib*"]

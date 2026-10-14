@@ -1,17 +1,9 @@
-try:
-    import MRzeroCore as mr0
-except Exception:  # pragma: no cover - optional dependency outside Slicer
-    mr0 = None
-
+import MRzeroCore as mr0
 import torch
 import numpy as np
+import SimpleITK as sitk
 
-try:
-    import SimpleITK as sitk
-except Exception:  # pragma: no cover - optional dependency outside Slicer
-    sitk = None
-
-from .RecoMRzero import RecoMRzero
+from MRzeroReconstructCoreLib.RecoMRzero import RecoMRzero
 
 
 class MRzeroReconstructLogic:
