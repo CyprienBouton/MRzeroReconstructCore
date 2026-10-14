@@ -13,6 +13,7 @@ dependencies = [
     "torch",
     "SimpleITK",
     "mrzerocore",
+    "typing",
 ]
 
 [tool.setuptools.packages.find]
