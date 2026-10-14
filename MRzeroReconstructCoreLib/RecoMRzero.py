@@ -305,7 +305,12 @@ class RecoMRzero:
         sens_np = sensitivities.cpu().numpy()
         kspace_np /= np.abs(kspace_np).max()
 
-        output_np = bart_python.bart(1, f'pics -R W:7:0:{regularization} -S -n', kspace_np, sens_np)
+        pics_cmd = 'pics'
+        if torch.cuda.is_available():
+            pics_cmd += ' -g'
+        pics_cmd += f' -R W:7:0:{regularization} -S -n'
+
+        output_np = bart_python.bart(1, pics_cmd, kspace_np, sens_np)
         # Handle 2D images
         if output_np.ndim == 2:
             output_np = output_np[:, :, np.newaxis]  
