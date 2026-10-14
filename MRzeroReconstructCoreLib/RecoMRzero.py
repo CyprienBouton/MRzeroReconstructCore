@@ -306,8 +306,6 @@ class RecoMRzero:
         kspace_np /= np.abs(kspace_np).max()
 
         pics_cmd = 'pics'
-        if torch.cuda.is_available():
-            pics_cmd += ' -g'
         pics_cmd += f' -R W:7:0:{regularization} -S -n'
 
         output_np = bart_python.bart(1, pics_cmd, kspace_np, sens_np)
