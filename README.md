@@ -69,16 +69,8 @@ Installing this package does not automatically install the external BART toolbox
 ### Import the reconstruction core
 
 ```python
-from MRzeroReconstructCore import RecoMRzero
+from MRzeroReconstructCore import MRzeroReconstructLogic
 ```
-
-To import a specific class or function:
-
-```python
-from MRzeroReconstructCore.RecoMRzero import YourClassName
-```
-
-Replace `YourClassName` with the actual class or function implemented in the module.
 
 ### Integration with 3D Slicer
 
