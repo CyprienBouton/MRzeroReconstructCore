@@ -130,18 +130,3 @@ The Python dependencies declared in `pyproject.toml` currently include:
 - `SimpleITK`
 
 Update `pyproject.toml` whenever additional required Python dependencies are introduced.
-
-## Compatibility
-
-- Compatibility with the target 3D Slicer version must be verified.
-- Python and dependency versions must be compatible with the runtime environment.
-- BART may require a separate installation and configuration.
-- Reconstruction behavior depends on the implementation and the input data.
-
-## License
-
-Add the applicable license and copyright information before distributing the project.
-
-## Acknowledgements
-
-Add references to the upstream MRzero project, BART, and any other libraries used by this implementation.
