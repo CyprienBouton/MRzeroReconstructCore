@@ -100,23 +100,6 @@ Ensure that the core package and its dependencies are accessible from Slicer's P
 python -m pip install -e .
 ```
 
-### Package imports
-
-Within `MRzeroReconstructCore/RecoMRzero.py`, use relative imports for modules in the same package:
-
-```python
-from . import ggrappa
-from . import bart_python
-```
-
-From outside the core package, use absolute imports:
-
-```python
-from MRzeroReconstructCore import RecoMRzero
-```
-
-Keep `__init__.py` files in the core package and its subpackages to support consistent package discovery.
-
 ## Dependencies
 
 The Python dependencies declared in `pyproject.toml` currently include:
