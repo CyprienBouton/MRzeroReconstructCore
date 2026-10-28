@@ -8,6 +8,14 @@ from .RecoMRzero import RecoMRzero
 
 class MRzeroReconstructLogic:
     @staticmethod
+    def add_gaussian_noise(signal, signal_ref, noise_factor):
+        noise_std_real = signal_ref.real.max()*noise_factor
+        noise_std_imag = signal_ref.imag.max()*noise_factor
+        real = signal.real + np.random.normal(0, noise_std_real, signal.real.shape)
+        imag = signal.imag + np.random.normal(0, noise_std_imag, signal.imag.shape)
+        return real*1j*imag
+
+    @staticmethod
     def kspace_to_sitk(kspace: torch.Tensor):
         if sitk is None:
             raise RuntimeError("SimpleITK is required for image conversion.")
@@ -99,7 +107,9 @@ class MRzeroReconstructLogic:
         reg=1e-4,
         tol=0.1,
         reg_cs=0.1,
-        reference_scan='mode'
+        reference_scan='mode',
+        signalPathRef=None,
+        gaussian_noise_factor=0.,
     ):
         if sequencePath.endswith('.seq'):
             if mr0 is None:
@@ -121,6 +131,11 @@ class MRzeroReconstructLogic:
 
         # Load signal
         signal_np = np.load(signalPath)
+        if signalPathRef is not None and gaussian_noise_factor>0.:
+            signal_ref_np = np.load(signalPathRef)
+            # add gaussian noise with std equal to the maximum * gaussian_noise_factor
+            signal_np= self.add_gaussian_noise(signal_np, signal_ref_np, gaussian_noise_factor)
+
         signal = torch.from_numpy(signal_np)
 
         # ============================================================
