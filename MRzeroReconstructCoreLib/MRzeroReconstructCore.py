@@ -13,7 +13,7 @@ class MRzeroReconstructLogic:
         noise_std_imag = signal_ref.imag.max()*noise_factor
         real = signal.real + np.random.normal(0, noise_std_real, signal.real.shape)
         imag = signal.imag + np.random.normal(0, noise_std_imag, signal.imag.shape)
-        return real*1j*imag
+        return real + 1j*imag
 
     @staticmethod
     def kspace_to_sitk(kspace: torch.Tensor):
