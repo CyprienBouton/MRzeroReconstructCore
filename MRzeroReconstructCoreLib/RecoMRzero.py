@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
+import MRzeroCore as mr0
 
 from . import bart_python  # BART python binding
 from . import ggrappa
