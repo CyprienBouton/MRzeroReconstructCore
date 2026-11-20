@@ -5,6 +5,25 @@ import torch.nn.functional as F
 from . import bart_python  # BART python binding
 from . import ggrappa
 
+def get_IR(seq0: mr0.sequence.Sequence):
+    """Get IR times and indices from a sequence.
+
+    Args:
+        seq (mr0.sequence.Sequence): MRzero base sequence.
+        
+    Returns:
+        torch.Tensor: timing before the inversion recovery pulses.
+        torch.Tensor: Indices of the inversion recovery pulses.
+    """
+    # compute the indices of each inversion
+    angle_max = max([r.pulse.angle for r in seq0])
+    idx_IRs = [i for i, r in enumerate(seq0) if r.pulse.angle==angle_max]
+    # Compute the minimum durations of the TRs
+    times_after = torch.cumsum(torch.tensor([r.event_time.sum() for r in seq0]), dim=0)
+    times_before = torch.tensor([ 0. ] + list(times_after[:-1]))
+    times_IR = times_before[idx_IRs]
+    return times_IR, idx_IRs
+
 
 def extract_indices_from_kspace_coords(kspace_coords: torch.Tensor, dk: float) -> torch.Tensor:
     """
@@ -44,6 +63,15 @@ class RecoMRzero:
         self.dy = dy
         self.dz = dz
 
+    def remove_navigator(self):
+        if len(np.unique(np.diff(get_IR(self.seq0)[1])))>1 and np.unique(np.diff(get_IR(self.seq0)[1]))[0]==2:
+            true_IRs = get_IR(self.seq0)[1][::2]
+            for i in true_IRs:
+                self.seq0[i+2].adc_usage = torch.zeros_like(self.seq0[i+2].adc_usage)
+                self.seq0[i+2].adc_usage = torch.zeros_like(self.seq0[i+2].adc_usage)
+                self.seq0[i+1].pulse.angle = torch.zeros_like(self.seq0[i+1].pulse.angle)
+                self.seq0[i+2].pulse.angle = torch.zeros_like(self.seq0[i+2].pulse.angle)
+    
     def cartesian_kspace_grid(self, signal, precision=5e-2,
                               dtype=torch.complex64, device='cpu'):
         """

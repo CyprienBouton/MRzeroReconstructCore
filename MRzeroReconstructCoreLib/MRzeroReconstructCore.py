@@ -110,6 +110,7 @@ class MRzeroReconstructLogic:
         reference_scan='mode',
         signalPathRef=None,
         gaussian_noise_factor=0.,
+        doRemoveNavigator=True,
     ):
         if sequencePath.endswith('.seq'):
             if mr0 is None:
@@ -141,6 +142,9 @@ class MRzeroReconstructLogic:
         # ============================================================
         # RAW CARTESIAN K-SPACE
         # ============================================================
+        if doRemoveNavigator:
+            reco.remove_navigator()
+
 
         raw_kspace, kx_vals, ky_vals, kz_vals = reco.cartesian_kspace_grid(
             signal
