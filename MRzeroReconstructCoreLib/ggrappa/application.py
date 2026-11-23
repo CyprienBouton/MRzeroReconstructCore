@@ -1,3 +1,8 @@
+# Vendored from gGRAPPA (upstream: https://github.com/mbertrait/ggrappa) via the fork
+# https://github.com/CyprienBouton/ggrappa, commit 39cfab0 (2025-09-19).
+# BSD 3-Clause License, Copyright (c) 2024, gGRAPPA Collaborators; see LICENSE in
+# this directory. The code below is unmodified apart from this header.
+
 import torch
 import logging
 
@@ -84,8 +89,10 @@ def apply_grappa_kernel(sig,
     rec = torch.zeros_like(sig)
 
     size_chunk_y = sbly + tbly*(batch_size - 1)
-    y_ival = range(shift_y, max(rec.shape[1] - sbly - 1, 1), tbly*batch_size)
-    z_ival = np.arange(0, max(rec.shape[2] - sblz - 1, 1), tblz)
+    # Local fix (see header): "+ 1" so that the last kernel positions are visited
+    # (the fork used "- 1", which left the last lines/partitions unfilled).
+    y_ival = range(shift_y, max(rec.shape[1] - sbly + 1, 1), tbly*batch_size)
+    z_ival = np.arange(0, max(rec.shape[2] - sblz + 1, 1), tblz)
     
     if not quiet:
         logger.info("GRAPPA Reconstruction...")

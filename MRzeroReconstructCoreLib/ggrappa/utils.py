@@ -1,3 +1,8 @@
+# Vendored from gGRAPPA (upstream: https://github.com/mbertrait/ggrappa) via the fork
+# https://github.com/CyprienBouton/ggrappa, commit 39cfab0 (2025-09-19).
+# BSD 3-Clause License, Copyright (c) 2024, gGRAPPA Collaborators; see LICENSE in
+# this directory. The code below is unmodified apart from this header.
+
 import torch
 import numpy as np
 import scipy as sp

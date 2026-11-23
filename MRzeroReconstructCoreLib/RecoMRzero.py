@@ -1,363 +1,391 @@
-import torch
+"""Low-level reconstruction of MRzero simulated signals.
+
+:class:`RecoMRzero` grids the simulated ADC samples of an MRzero sequence onto
+a Cartesian k-space and provides the reconstruction back-ends used by
+:class:`MRzeroReconstructCoreLib.MRzeroReconstructLogic`:
+
+* centred inverse FFT,
+* GRAPPA (vendored ``ggrappa``),
+* wavelet-regularized compressed sensing after discarding the samples acquired
+  with an irregular recovery time ("Zero-filled" method).
+
+K-space arrays follow the conventions documented in :mod:`.reco_utils`
+(``[nx, ny, nz, ncoils]``, k = 0 at index ``n // 2`` once centred).
+"""
+
+from typing import Optional, Sequence, Tuple
+
 import numpy as np
-import torch.nn.functional as F
-import MRzeroCore as mr0
+import torch
 
-from . import bart_python  # BART python binding
-from . import ggrappa
+from . import reco_utils
+from .compressed_sensing import reconstruct_cartesian_cs
 
-def get_IR(seq0: mr0.sequence.Sequence):
-    """Get IR times and indices from a sequence.
+
+def get_IR(seq0) -> Tuple[torch.Tensor, list]:
+    """Start times and indices of the inversion pulses of a sequence.
+
+    Inversion pulses are the repetitions whose flip angle equals the largest
+    flip angle of the sequence.
 
     Args:
-        seq (mr0.sequence.Sequence): MRzero base sequence.
-        
+        seq0 (MRzeroCore.Sequence): MRzero sequence.
+
     Returns:
-        torch.Tensor: timing before the inversion recovery pulses.
-        torch.Tensor: Indices of the inversion recovery pulses.
+        (times_IR, idx_IRs): start time [s] of each inversion repetition and
+        its index in ``seq0``.
     """
-    # compute the indices of each inversion
-    angle_max = max([r.pulse.angle for r in seq0])
-    idx_IRs = [i for i, r in enumerate(seq0) if r.pulse.angle==angle_max]
-    # Compute the minimum durations of the TRs
-    times_after = torch.cumsum(torch.tensor([r.event_time.sum() for r in seq0]), dim=0)
-    times_before = torch.tensor([ 0. ] + list(times_after[:-1]))
-    times_IR = times_before[idx_IRs]
-    return times_IR, idx_IRs
+    angle_max = max(float(r.pulse.angle) for r in seq0)
+    idx_IRs = [i for i, r in enumerate(seq0) if float(r.pulse.angle) == angle_max]
+    times_before = _repetition_start_times(seq0)
+    return times_before[idx_IRs], idx_IRs
+
+
+def _repetition_start_times(seq0) -> torch.Tensor:
+    """Start time [s] of every repetition (cumulative sum of event times)."""
+    durations = torch.stack([torch.as_tensor(r.event_time).sum() for r in seq0])
+    times_after = torch.cumsum(durations, dim=0)
+    return torch.cat([torch.zeros(1, dtype=times_after.dtype), times_after[:-1]])
+
+
+def _adc_count(rep) -> int:
+    """Number of measured samples of a repetition (``adc_usage > 0``)."""
+    return int((rep.adc_usage > 0).sum())
 
 
 def extract_indices_from_kspace_coords(kspace_coords: torch.Tensor, dk: float) -> torch.Tensor:
-    """
-    Compute discrete k-space indices for each coordinate in the input array.
-    This avoids cumulative floating-point error by rounding each gap individually.
+    """Integer grid index of every k-space coordinate along one axis.
+
+    The sorted unique coordinates are converted to indices by rounding every
+    gap between consecutive coordinates to a multiple of ``dk`` and summing
+    the rounded gaps. Rounding each gap individually avoids the accumulation
+    of floating-point error of ``round((k - k_min) / dk)`` and keeps
+    undersampling gaps (e.g. GRAPPA) on the grid.
 
     Args:
-        kspace_coords (torch.Tensor): 1D tensor of k-space coordinates (e.g., phase-encode positions).
-        dk (float): Expected k-space step size along this axis.
+        kspace_coords: 1D tensor of k-space coordinates.
+        dk: k-space step along this axis.
 
     Returns:
-        torch.Tensor: 1D tensor of integer indices, same shape as kspace_coords.
+        1D integer tensor with the same shape as ``kspace_coords``.
     """
-    device = kspace_coords.device
-
-    # Get sorted unique coordinates and inverse mapping
     unique_coords, inverse = torch.unique(kspace_coords, sorted=True, return_inverse=True)
-
-    # Compute relative step sizes between consecutive coordinates,
-    # normalized by dk and rounded to the nearest integer
     gaps = torch.round(torch.diff(unique_coords) / dk).to(torch.long)
+    gaps = torch.cat([torch.zeros(1, dtype=torch.long, device=kspace_coords.device), gaps])
+    return torch.cumsum(gaps, dim=0)[inverse]
 
-    # Insert a zero at the beginning so length matches unique_coords
-    gaps = torch.cat([torch.zeros(1, dtype=torch.long, device=device), gaps])
 
-    # Cumulative sum → integer indices for unique coords
-    unique_indices = torch.cumsum(gaps, dim=0)
-
-    # Map each original coordinate back to its index
-    return unique_indices[inverse]
+def _step_near_zero(unique_values: torch.Tensor, default: float) -> torch.Tensor:
+    """k-space step measured next to k = 0 (assumed fully sampled there)."""
+    if unique_values.numel() < 2:
+        return torch.as_tensor(default)
+    steps = unique_values.diff()
+    index = min(int(unique_values.abs().argmin()), steps.numel() - 1)
+    return steps[index]
 
 
 class RecoMRzero:
+    """Cartesian reconstruction of an MRzero simulated signal.
+
+    Typical use::
+
+        reco = RecoMRzero(seq)
+        reco.remove_navigator()                      # optional
+        raw, kx, ky, kz = reco.cartesian_kspace_grid(signal)
+        kspace, center = reco.center_kspace(raw)
+        image = reco.fft_reconstruct(kspace)
+
+    Args:
+        seq0: ``MRzeroCore.Sequence`` (loaded from ``.seq`` or ``.pkl``).
+        dx, dy, dz: k-space steps [1/m]. ``None`` measures them next to k = 0
+            (which must therefore be fully sampled).
+    """
+
+    #: Assumed slice thickness when the sequence has a single partition.
+    DEFAULT_SINGLE_SLICE_THICKNESS = 5e-3  # [m]
+
     def __init__(self, seq0, dx=None, dy=None, dz=None):
         self.seq0 = seq0
         self.dx = dx
         self.dy = dy
         self.dz = dz
+        # Set by cartesian_kspace_grid():
+        self.ix = self.iy = self.iz = None
+        self.nx = self.ny = self.nz = None
+        self.ncoils = None
+        self.kspace_center = None
+        # Set by remove_navigator(): signal samples to keep.
+        self.signal_keep_mask = None
 
-    def remove_navigator(self):
-        if len(np.unique(np.diff(get_IR(self.seq0)[1])))>1 and np.unique(np.diff(get_IR(self.seq0)[1]))[0]==2:
-            true_IRs = get_IR(self.seq0)[1][::2]
-            for i in true_IRs:
-                self.seq0[i+2].adc_usage = torch.zeros_like(self.seq0[i+2].adc_usage)
-                self.seq0[i+2].adc_usage = torch.zeros_like(self.seq0[i+2].adc_usage)
-                self.seq0[i+1].pulse.angle = torch.zeros_like(self.seq0[i+1].pulse.angle)
-                self.seq0[i+2].pulse.angle = torch.zeros_like(self.seq0[i+2].pulse.angle)
-    
-    def cartesian_kspace_grid(self, signal, precision=5e-2,
-                              dtype=torch.complex64, device='cpu'):
-        """
-        Build a Cartesian k-space grid from non-uniform k-space coordinates and signal.
+    # ================================================================
+    # SEQUENCE PREPARATION
+    # ================================================================
+
+    def remove_navigator(self) -> bool:
+        """Discard the navigator blocks of inversion-recovery sequences.
+
+        The navigator is detected when the inversion pulses (largest flip
+        angle) come in pairs two repetitions apart: for every first pulse
+        ``i`` of a pair, the ADC of repetition ``i + 2`` is disabled and the
+        flip angles of repetitions ``i + 1`` and ``i + 2`` are set to zero, so
+        that :meth:`cartesian_kspace_grid` and the inversion-time analysis
+        ignore the navigator.
+
+        The sequence is modified in place. The signal samples that belonged
+        to the disabled ADCs are recorded in :attr:`signal_keep_mask` and
+        dropped by :meth:`cartesian_kspace_grid` if the signal still
+        contains them.
 
         Returns:
-            grid: tensor [nx, ny, nz, ncoils]
-            kx_vals, ky_vals, kz_vals: 1D tensors of grid coordinates
+            True if a navigator pattern was found and removed.
         """
+        _, idx_IRs = get_IR(self.seq0)
+        unique_gaps = np.unique(np.diff(idx_IRs))
+        if len(unique_gaps) <= 1 or unique_gaps[0] != 2:
+            return False
+
+        adc_counts = [_adc_count(r) for r in self.seq0]
+        removed = set()
+        for i in idx_IRs[::2]:
+            if i + 2 >= len(self.seq0):
+                break
+            navigator = self.seq0[i + 2]
+            # NOTE: the original code zeroed `seq0[i + 2].adc_usage` twice;
+            # whether `seq0[i + 1].adc_usage` was intended is unverified.
+            navigator.adc_usage = torch.zeros_like(navigator.adc_usage)
+            self.seq0[i + 1].pulse.angle = torch.zeros_like(torch.as_tensor(self.seq0[i + 1].pulse.angle))
+            navigator.pulse.angle = torch.zeros_like(torch.as_tensor(navigator.pulse.angle))
+            removed.add(i + 2)
+
+        self.signal_keep_mask = torch.cat([
+            torch.full((count,), index not in removed, dtype=torch.bool)
+            for index, count in enumerate(adc_counts)
+        ])
+        return True
+
+    # ================================================================
+    # GRIDDING
+    # ================================================================
+
+    def cartesian_kspace_grid(self, signal: torch.Tensor, precision: float = 5e-2,
+                              dtype=torch.complex64, device="cpu"):
+        """Grid the simulated signal onto a Cartesian k-space.
+
+        The k-space position of every ADC sample comes from
+        ``seq0.get_kspace()`` [1/m]. Coordinates are rounded to ``precision``
+        and converted to grid indices with
+        :func:`extract_indices_from_kspace_coords`. Samples falling on the same
+        grid point are summed. Positions that were not acquired stay zero.
+
+        Args:
+            signal: ``[n_samples, ncoils]`` (or ``[n_samples]``) complex signal.
+            precision: rounding step of the k-space coordinates [1/m].
+
+        Returns:
+            grid: ``[nx, ny, nz, ncoils]`` k-space (not centred).
+            kx_vals, ky_vals, kz_vals: sorted unique rounded coordinates.
+
+        Side effects:
+            Sets ``ix, iy, iz`` (grid index of every sample), ``nx, ny, nz,
+            ncoils``, the steps ``dx, dy, dz`` and :attr:`kspace_center`
+            (grid index of the sample closest to k = 0).
+        """
+        if signal.dim() == 1:
+            signal = signal.unsqueeze(-1)
+
         kspace_coords = self.seq0.get_kspace()
-        kx, ky, kz = kspace_coords[:, :3].T
-
-        # Round coordinates
-        kx_rounded = ((kx / precision).round() * precision)
-        ky_rounded = ((ky / precision).round() * precision)
-        kz_rounded = ((kz / precision).round() * precision)
-
-        # Get sorted unique coordinates
-        kx_rounded_unique = kx_rounded.unique().sort().values
-        ky_rounded_unique = ky_rounded.unique().sort().values
-        kz_rounded_unique = kz_rounded.unique().sort().values
-
-        # Determine step sizes if not provided assume fully sampled in center
-        if self.dx is None:
-            self.dx = kx_rounded_unique.diff()[kx_rounded_unique.abs().argmin()]
-        if self.dy is None:
-            self.dy = ky_rounded_unique.diff()[ky_rounded_unique.abs().argmin()]
-        if self.dz is None:
-            if len(kz_rounded_unique) > 1:
-                self.dz = kz_rounded_unique.diff()[kz_rounded_unique.abs().argmin()]
+        n_samples = kspace_coords.shape[0]
+        if signal.shape[0] != n_samples:
+            keep = self.signal_keep_mask
+            if keep is not None and signal.shape[0] == keep.numel() and int(keep.sum()) == n_samples:
+                signal = signal[keep]
             else:
-                self.dz = 1/(5e-3)  # Assume 5mm spacing if only one slice
+                raise ValueError(
+                    f"The signal has {signal.shape[0]} samples but the sequence "
+                    f"has {n_samples} ADC samples."
+                )
 
-        # Compute nearest grid indices
+        kx, ky, kz = kspace_coords[:, :3].T
+        kx_rounded = (kx / precision).round() * precision
+        ky_rounded = (ky / precision).round() * precision
+        kz_rounded = (kz / precision).round() * precision
+        kx_unique = kx_rounded.unique(sorted=True)
+        ky_unique = ky_rounded.unique(sorted=True)
+        kz_unique = kz_rounded.unique(sorted=True)
+
+        # Steps measured next to k = 0, which must be fully sampled.
+        if self.dx is None:
+            self.dx = _step_near_zero(kx_unique, 1.0)
+        if self.dy is None:
+            self.dy = _step_near_zero(ky_unique, 1.0)
+        if self.dz is None:
+            # A single partition (2D) gets a nominal slice thickness:
+            # spacing = 1 / (dz * nz) = DEFAULT_SINGLE_SLICE_THICKNESS.
+            self.dz = _step_near_zero(kz_unique, 1.0 / self.DEFAULT_SINGLE_SLICE_THICKNESS)
+
         self.ix = extract_indices_from_kspace_coords(kx_rounded, self.dx)
         self.iy = extract_indices_from_kspace_coords(ky_rounded, self.dy)
         self.iz = extract_indices_from_kspace_coords(kz_rounded, self.dz)
 
-        # Define grid ranges
-        self.nx, self.ny, self.nz = self.ix.max()+1, self.iy.max()+1, self.iz.max()+1
+        self.nx = int(self.ix.max()) + 1
+        self.ny = int(self.iy.max()) + 1
+        self.nz = int(self.iz.max()) + 1
         self.ncoils = signal.shape[1]
 
-        grid = torch.zeros((self.nx, self.ny, self.nz, self.ncoils), dtype=dtype, device=device)
-        # Fill the grid safely (accumulate for repeated coordinates)
-        grid.index_put_((self.ix, self.iy, self.iz), signal.to(dtype), accumulate=True)
-
-        return grid, kx_rounded_unique, ky_rounded_unique, kz_rounded_unique
-
-    def get_acs_from_kspace(self, kspace: torch.Tensor) -> torch.Tensor:
-        """
-        Extract the largest fully sampled ACS region from 3D k-space.
-
-        Args:
-            kspace (torch.Tensor): Full k-space data [nx, ny, nz, ncoils]
-
-        Returns:
-            torch.Tensor: ACS region [n_acsx, n_acsy, n_acsz, ncoils]
-        """
-        mask = kspace.abs().sum(dim=-1) > 0  # [nx, ny, nz]
-
-        full_x = mask.any(dim=(1, 2))
-        full_y = mask.any(dim=(0, 2))
-        full_z = mask.any(dim=(0, 1))
-
-        def contiguous_true_indices(bool_tensor):
-            indices = torch.where(bool_tensor)[0]
-            if len(indices) == 0:
-                return None, None
-            diffs = torch.diff(indices)
-            breaks = torch.where(diffs > 1)[0]
-            starts = torch.cat((indices[0:1], indices[breaks + 1]))
-            ends = torch.cat((indices[breaks], indices[-1:]))
-            lengths = ends - starts + 1
-            max_idx = torch.argmax(lengths)
-            return starts[max_idx].item(), ends[max_idx].item() + 1
-
-        x_start, x_end = contiguous_true_indices(full_x)
-        y_start, y_end = contiguous_true_indices(full_y)
-        z_start, z_end = contiguous_true_indices(full_z)
-
-        if None in (x_start, x_end, y_start, y_end, z_start, z_end):
-            raise ValueError("No fully sampled ACS region found in k-space.")
-
-        acs = kspace[x_start:x_end, y_start:y_end, z_start:z_end, :]
-
-        return acs
-    
-    def _bart_python_reconstruct(self, kspace: torch.Tensor,
-                                bart_cmd: str) -> torch.Tensor:
-        """
-        Run a BART command on k-space data, handling tensor formatting and device.
-
-        Args:
-            kspace: torch.Tensor [nx, ny, nz, ncoils]
-            bart_cmd: str, BART command (e.g. 'fft -i -d 3')
-
-        Returns:
-            torch.Tensor: Output tensor from BART command
-        """
-        # bart_input = kspace.permute(3, 1, 2, 0).contiguous()
-
-        output_np = bart_python.bart(1, bart_cmd, kspace.cpu().numpy())
-
-        # Convert back to torch and restore device
-        output_tensor = torch.from_numpy(output_np).to(kspace.device)
-
-        return output_tensor
-
-    def grappa_reconstruct(self, kspace: torch.Tensor, acs: torch.Tensor,
-                           af=[2,1], kernel_size=(4,4,5), reg=1e-4,
-                           batch_size=1, cuda=True, quiet=True) -> torch.Tensor:
-        """
-        Perform GRAPPA reconstruction using the ggrappa implementation.
-
-        Args:
-            kspace: torch.Tensor [nx, ny, nz, ncoils]
-            acs: torch.Tensor ACS region [n_acsx, n_acsy, n_acsz, ncoils]
-            af: list or tuple, acceleration factors [afy, afz]
-            kernel_size: GRAPPA kernel size
-            reg: regularization lambda
-            batch_size: batch size for kernel application
-            cuda: use GPU
-            quiet: suppress output
-
-        Returns:
-            torch.Tensor: Reconstructed kspace [nx, ny, nz, ncoils]
-        """
-        # Reorder from [nx, ny, nz, ncoils] to [ncoils, ky, kz, kx] for ggrappa
-        kspace_bart = kspace.permute(3, 1, 2, 0).contiguous()
-        acs_bart = acs.permute(3, 1, 2, 0).contiguous()
-
-        # Run GRAPPA reconstruction
-        reco_kspace, _ = ggrappa.GRAPPA_Recon(
-            sig=kspace_bart,
-            acs=acs_bart,
-            af=af,
-            kernel_size=kernel_size,
-            lambda_=reg,
-            batch_size=batch_size,
-            cuda=cuda,
-            quiet=quiet
+        # Grid index of k = 0 (closest sample) along each axis.
+        self.kspace_center = (
+            int(self.ix[kx_rounded.abs().argmin()]),
+            int(self.iy[ky_rounded.abs().argmin()]),
+            int(self.iz[kz_rounded.abs().argmin()]),
         )
 
-        # Convert back to [nx, ny, nz, ncoils]
-        reco_kspace = reco_kspace.permute(3, 1, 2, 0).contiguous()
+        grid = torch.zeros((self.nx, self.ny, self.nz, self.ncoils), dtype=dtype, device=device)
+        grid.index_put_((self.ix, self.iy, self.iz), signal.to(dtype=dtype, device=device),
+                        accumulate=True)
+        return grid, kx_unique, ky_unique, kz_unique
 
-        return self.fft_reconstruct(reco_kspace)
-    
-    def fft_reconstruct(self, kspace: torch.Tensor) -> torch.Tensor:
+    def center_kspace(self, kspace: torch.Tensor):
+        """Zero-pad the gridded k-space so that k = 0 is at index ``n // 2``.
+
+        Returns ``(centered_kspace, new_center)``; see
+        :func:`.reco_utils.center_kspace`. No sample is discarded.
         """
-        Perform FFT reconstruction on the kspace data using BART.
+        if self.kspace_center is None:
+            raise RuntimeError("Call cartesian_kspace_grid() first.")
+        return reco_utils.center_kspace(kspace, self.kspace_center)
+
+    # ================================================================
+    # RECONSTRUCTION BACK-ENDS
+    # ================================================================
+
+    def fft_reconstruct(self, kspace: torch.Tensor) -> torch.Tensor:
+        """Unitary centred inverse FFT over the three encoding axes.
 
         Args:
-            kspace: torch.Tensor [nx, ny, nz, ncoils]
-            bart_slc_axis: int, axis used for slice calibration (default=0)
+            kspace: centred k-space ``[nx, ny, nz, ncoils]``.
 
         Returns:
-            torch.Tensor: Reconstructed image data
+            Complex coil images ``[nx, ny, nz, ncoils]``.
         """
-        bitmask = 7  # dims 0,1,2 -> 1<<0 + 1<<1 + 1<<2 = 7
-        bart_cmd = f'fft -i -u {bitmask}'
-        return self._bart_python_reconstruct(kspace, bart_cmd)
+        return reco_utils.centered_ifft(kspace, dims=(0, 1, 2))
 
-    def pad_kspace_to_center(self, kspace, kx_vals, ky_vals, kz_vals):
+    def get_acs_from_kspace(self, kspace: torch.Tensor,
+                            center: Optional[Sequence[int]] = None) -> torch.Tensor:
+        """Largest fully sampled block around the centre of a centred k-space."""
+        return reco_utils.get_acs_from_kspace(kspace, center)
+
+    def grappa_reconstruct(self, kspace: torch.Tensor, acs: torch.Tensor,
+                           af: Optional[Sequence[int]] = None,
+                           kernel_size: Sequence[int] = (4, 4, 5),
+                           reg: float = 1e-4, batch_size: int = 1,
+                           cuda: Optional[bool] = None, quiet: bool = True) -> torch.Tensor:
+        """GRAPPA k-space filling; returns k-space ``[nx, ny, nz, ncoils]``.
+
+        See :func:`.reco_utils.grappa_reconstruct` for the maths and the
+        parameters. ``af=None`` estimates the acceleration from the sampling
+        pattern; ``cuda=None`` uses the GPU when available.
         """
-        Shift the Cartesian k-space data so that the sample closest to
-        physical k=0 is located at the center of each array dimension.
+        return reco_utils.grappa_reconstruct(kspace, acs, af=af, kernel_size=kernel_size,
+                                             reg=reg, batch_size=batch_size, cuda=cuda,
+                                             quiet=quiet)
 
-        No wrapping is performed. Samples shifted outside the array are discarded.
+    def zero_filled_cs(self, kspace: torch.Tensor, tolerance: float = 0.15,
+                       regularization: float = 0.1, reference_scan: str = "mode",
+                       calib_kernel: str = "6:6:2") -> torch.Tensor:
+        """Compressed sensing after discarding irregular-recovery samples.
+
+        In inversion-recovery sequences with a variable delay between shots,
+        each k-space line inherits the time since the previous inversion of
+        its shot (:meth:`get_inter_scan_duration`). Lines whose duration
+        differs from the reference duration by more than
+        ``tolerance * reference`` are excluded from the data fidelity term.
+        Coil sensitivities come from central k-space before that exclusion.
+
+        Args:
+            kspace: *raw* (not centred) gridded k-space from
+                :meth:`cartesian_kspace_grid`.
+            tolerance: relative tolerance on the recovery duration.
+            regularization: L1-wavelet weight ``lambda``.
+            reference_scan: ``"mode"`` (most frequent duration) or ``"min"``.
+            calib_kernel: Colon-separated widths of the central calibration window (x:y:z).
+
+        Returns:
+            Complex coil-combined image ``[nx, ny, nz]`` on the centred grid.
         """
-
-        def zero_index(k_vals):
-            return torch.argmin(torch.abs(k_vals)).item()
-
-        def shift_axis(src, shift, axis):
-            dst = torch.zeros_like(src)
-
-            if shift >= 0:
-                src_start = 0
-                src_end = src.shape[axis] - shift
-                dst_start = shift
-                dst_end = src.shape[axis]
-            else:
-                src_start = -shift
-                src_end = src.shape[axis]
-                dst_start = 0
-                dst_end = src.shape[axis] + shift
-
-            src_slices = [slice(None)] * src.ndim
-            dst_slices = [slice(None)] * src.ndim
-
-            src_slices[axis] = slice(src_start, src_end)
-            dst_slices[axis] = slice(dst_start, dst_end)
-
-            dst[tuple(dst_slices)] = src[tuple(src_slices)]
-
-            return dst
-
-        nx, ny, nz, nc = kspace.shape
-
-        # Location of physical k = 0
-        zero_x = zero_index(kx_vals)
-        zero_y = zero_index(ky_vals)
-        zero_z = zero_index(kz_vals)
-
-        # Desired array center
-        center_x = nx // 2
-        center_y = ny // 2
-        center_z = nz // 2
-
-        # Required shifts
-        shift_x = center_x - zero_x
-        shift_y = center_y - zero_y
-        shift_z = center_z - zero_z
-
-        # Apply shifts without wrapping
-        centered = shift_axis(kspace, shift_x, axis=0)
-        centered = shift_axis(centered, shift_y, axis=1)
-        centered = shift_axis(centered, shift_z, axis=2)
-
-        return centered
-    
-    def get_spacing(self):
-        # Correct voxel spacing in mm
-        spacing_x = 1.0 / (self.dx * self.nx)
-        spacing_y = 1.0 / (self.dy * self.ny)
-        spacing_z = 1.0 / (self.dz * self.nz)
-
-        spacing = (spacing_x.item()*1e3, spacing_y.item()*1e3, spacing_z.item()*1e3)
-        return spacing
-    
-    def zero_filled_cs(self, kspace: torch.Tensor, kx_vals, ky_vals, kz_vals, 
-                       tolerance=0.15, regularization=0.1, reference_scan='mode') -> torch.Tensor:
         inter_scan_matrix = self.get_inter_scan_duration()
-        matrix_flat = inter_scan_matrix.flatten()
-        matrix_flat = torch.round(matrix_flat * 10) / 10
-        matrix_flat = matrix_flat[~torch.isnan(matrix_flat)]
-        if reference_scan=='mode':
-            regular_inter_scan, _ = torch.mode(matrix_flat)
-        elif reference_scan=='min':
-            regular_inter_scan = matrix_flat.min()
+        durations = torch.round(inter_scan_matrix.flatten() * 10) / 10
+        durations = durations[~torch.isnan(durations)]
+        if durations.numel() == 0:
+            raise ValueError(
+                "No inversion pulse found: the 'Zero-filled' method needs an "
+                "inversion-recovery sequence."
+            )
+        if reference_scan == "mode":
+            reference, _ = torch.mode(durations)
+        elif reference_scan == "min":
+            reference = durations.min()
         else:
             raise ValueError("reference_scan must be 'mode' or 'min'")
-        # --------------------- ADDED BLOCK ---------------------
-        # Zero-out k-space samples where inter-scan duration > 1.2
-        bad_mask = (abs(inter_scan_matrix-regular_inter_scan) > tolerance*regular_inter_scan)            # shape: (ny, nz)
 
-        # reshape mask to broadcast over (nx, ny, nz, ncoils)
-        bad_mask4d = bad_mask.unsqueeze(0).unsqueeze(-1)   # (1, ny, nz, 1)
-        sensitivities = bart_python.bart(1, "ecalib -m1 -k 6:6:2", kspace.cpu().numpy())
-        while sensitivities.ndim < kspace.ndim:
-            sensitivities = sensitivities[:, :, :, np.newaxis]
-        sensitivities = self.pad_kspace_to_center(torch.from_numpy(sensitivities), kx_vals, ky_vals, kz_vals)
-        kspace_filled = kspace.masked_fill(bad_mask4d, 0)
-        # -------------------------------------------------------
-        kspace = self.pad_kspace_to_center(kspace, kx_vals, ky_vals, kz_vals)
-        kspace_filled = self.pad_kspace_to_center(kspace_filled, kx_vals, ky_vals, kz_vals)
-        kspace_np = kspace_filled.cpu().numpy()
-        sens_np = sensitivities.cpu().numpy()
-        kspace_np /= np.abs(kspace_np).max()
+        # [ny, nz] mask of lines acquired with an irregular recovery time.
+        # NaN durations (lines acquired before the first inversion) compare
+        # False and are therefore kept.
+        bad_mask = torch.abs(inter_scan_matrix - reference) > tolerance * reference
+        acquired = torch.zeros(kspace.shape[:3], dtype=torch.bool, device=kspace.device)
+        acquired[self.ix, self.iy, self.iz] = True
+        retained = acquired & ~bad_mask.to(kspace.device).unsqueeze(0)
 
-        pics_cmd = 'pics'
-        pics_cmd += f' -R W:7:0:{regularization} -S -n'
+        centered, _ = self.center_kspace(kspace)
+        acquired, _ = self.center_kspace(acquired)
+        retained, _ = self.center_kspace(retained)
+        return reconstruct_cartesian_cs(centered, acquired, retained, regularization,
+                                        calib_kernel)
 
-        output_np = bart_python.bart(1, pics_cmd, kspace_np, sens_np)
-        # Handle 2D images
-        if output_np.ndim == 2:
-            output_np = output_np[:, :, np.newaxis]  
-            
-        output = torch.from_numpy(output_np).to(kspace.device).abs()
-        return output
-    
-    def get_inter_scan_duration(self, eps=0.2, dtype=torch.float, device='cpu'):
+    def get_inter_scan_duration(self, eps: float = 0.2, dtype=torch.float,
+                                device="cpu") -> torch.Tensor:
+        """Duration between consecutive inversions, per k-space line.
+
+        Inversion pulses are the repetitions with a flip angle within ``eps``
+        rad of pi. Each ADC sample is assigned to the shot started by the
+        last inversion before it; the line ``(iy, iz)`` of the sample gets the
+        time elapsed between that inversion and the previous one.
+
+        Returns:
+            ``[ny, nz]`` tensor [s]; NaN for lines without a preceding pair
+            of inversions.
+        """
+        if self.iy is None:
+            raise RuntimeError("Call cartesian_kspace_grid() first.")
         inter_scan_matrix = torch.full((self.ny, self.nz), torch.nan, dtype=dtype, device=device)
-        times_after = torch.cumsum(torch.tensor([r.event_time.sum() for r in self.seq0]), dim=0)
-        times_before = torch.tensor([ 0. ] + list(times_after[:-1]))
-        IR_idx = [i for i, r in enumerate(self.seq0) if abs( r.pulse.angle - torch.pi ) < eps]
-        times_IR = times_before[IR_idx]
-        inter_scan_durations = torch.diff(times_IR, prepend=torch.tensor([torch.nan]) )
-        times_IR_next = torch.cat( [times_IR[1:], torch.tensor([torch.inf])] )
-        for time_IR, time_IR_next, duration in zip(times_IR, times_IR_next, inter_scan_durations):
-            current_shot = (times_before>time_IR)*(times_before<time_IR_next)
+        times_before = _repetition_start_times(self.seq0)
+        idx_IR = [i for i, r in enumerate(self.seq0)
+                  if abs(float(r.pulse.angle) - np.pi) < eps]
+        times_IR = times_before[idx_IR]
+        durations = torch.diff(times_IR, prepend=torch.tensor([torch.nan], dtype=times_IR.dtype))
+        times_IR_next = torch.cat([times_IR[1:], torch.tensor([torch.inf], dtype=times_IR.dtype)])
+        adc_counts = [_adc_count(r) for r in self.seq0]
+        for time_IR, time_IR_next, duration in zip(times_IR, times_IR_next, durations):
+            in_shot = (times_before > time_IR) & (times_before < time_IR_next)
             mask_signal = torch.cat([
-                torch.full((int(r.adc_usage.sum()),), is_shot, dtype=torch.int64)
-                for is_shot, r in zip(current_shot, self.seq0)
-            ]).to(bool)
-            inter_scan_matrix[self.iy[mask_signal], self.iz[mask_signal]] = duration
+                torch.full((count,), bool(flag), dtype=torch.bool)
+                for flag, count in zip(in_shot, adc_counts)
+            ])
+            inter_scan_matrix[self.iy[mask_signal], self.iz[mask_signal]] = duration.to(dtype)
         return inter_scan_matrix
+
+    # ================================================================
+    # GEOMETRY
+    # ================================================================
+
+    def get_spacing(self, shape: Optional[Sequence[int]] = None) -> Tuple[float, float, float]:
+        """Voxel size [mm] of an image reconstructed on a grid of ``shape``.
+
+        The field of view along an axis is ``1 / dk``, so a grid of ``n``
+        points has a voxel size of ``1 / (dk * n)`` m. ``shape`` defaults to
+        the gridded size ``(nx, ny, nz)``; pass the centred (padded) shape
+        when the k-space was zero-padded.
+        """
+        if shape is None:
+            shape = (self.nx, self.ny, self.nz)
+        steps = (self.dx, self.dy, self.dz)
+        return tuple(float(1.0 / (float(dk) * int(n))) * 1e3 for dk, n in zip(steps, shape[:3]))

@@ -1,0 +1,27 @@
+# Python byte code and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Build artefacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Environments and editors
+.venv/
+venv/
+.vscode/
+.idea/
+
+# BART temporary files
+*.cfl
+*.hdr
+
+# Raw / simulated data (may contain patient data; never commit)
+*.dat
+*.npy
+*.npz
+*.nii
+*.nii.gz

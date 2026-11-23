@@ -1,274 +1,217 @@
-import MRzeroCore as mr0
-import torch
+"""High-level reconstruction entry point for MRzero simulated signals.
+
+:class:`MRzeroReconstructLogic` is the API used by the 3D Slicer extension
+``MRzeroReconstruct``. It loads a sequence (``.seq`` or pickled
+``MRzeroCore.Sequence``) and a simulated signal (``.npy``), reconstructs it
+and returns SimpleITK images ready to be loaded in Slicer.
+"""
+
+import os
+import pickle
+from typing import Optional, Sequence
+
 import numpy as np
 import SimpleITK as sitk
+import torch
 
+from . import reco_utils
 from .RecoMRzero import RecoMRzero
+
+#: Reconstruction methods accepted by ``runReconstruction`` (case-insensitive).
+METHODS = ("FFT", "GRAPPA", "Zero-filled")
+
+#: Orientation of reconstructed MRzero images (x axis flipped for Slicer's RAS display).
+IMAGE_DIRECTION = (-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+
+
+def load_sequence(sequencePath: str):
+    """Load an MRzero sequence from a Pulseq ``.seq`` file or a pickled ``.pkl``.
+
+    ``.pkl`` files are unpickled: only load files you trust.
+    """
+    sequencePath = os.path.normpath(os.fspath(sequencePath))
+    if sequencePath.endswith(".seq"):
+        import MRzeroCore as mr0
+        return mr0.Sequence.import_file(sequencePath)
+    if sequencePath.endswith(".pkl"):
+        import MRzeroCore  # noqa: F401  (classes needed to unpickle the sequence)
+        with open(sequencePath, "rb") as f:
+            return pickle.load(f)
+    raise ValueError(f"Unsupported sequence file format: {sequencePath} (expected .seq or .pkl)")
 
 
 class MRzeroReconstructLogic:
+    """Reconstruct MRzero simulated signals into SimpleITK volumes."""
+
+    # ================================================================
+    # HELPERS (kept as static methods for backward compatibility)
+    # ================================================================
+
     @staticmethod
-    def add_gaussian_noise(signal, signal_ref, noise_factor):
-        noise_std_real = signal_ref.real.max()*noise_factor
-        noise_std_imag = signal_ref.imag.max()*noise_factor
+    def add_gaussian_noise(signal: np.ndarray, signal_ref: np.ndarray,
+                           noise_factor: float) -> np.ndarray:
+        """Add complex white Gaussian noise to a simulated signal.
+
+        The standard deviations of the real and imaginary noise are
+        ``noise_factor * max(Re(signal_ref))`` and
+        ``noise_factor * max(Im(signal_ref))`` respectively.
+        """
+        noise_std_real = signal_ref.real.max() * noise_factor
+        noise_std_imag = signal_ref.imag.max() * noise_factor
         real = signal.real + np.random.normal(0, noise_std_real, signal.real.shape)
         imag = signal.imag + np.random.normal(0, noise_std_imag, signal.imag.shape)
-        return real + 1j*imag
+        return real + 1j * imag
 
     @staticmethod
-    def kspace_to_sitk(kspace: torch.Tensor):
-        if sitk is None:
-            raise RuntimeError("SimpleITK is required for image conversion.")
-        """
-        Convert Cartesian multi-coil k-space into a scalar volume
-        suitable for visualization in 3D Slicer.
-
-        The coil dimension is combined using root-sum-of-squares.
-        The magnitude is log-compressed to visualize the large
-        dynamic range of k-space.
-        """
-
-        # Combine coils using root-sum-of-squares
-        kspace_magnitude = torch.sqrt(
-            torch.sum(torch.abs(kspace) ** 2, dim=-1)
-        )
-
-        # Log compression
-        kspace_display = torch.log1p(kspace_magnitude)
-
-        # Normalize to [0, 1]
-        kspace_display = kspace_display - kspace_display.min()
-
-        max_value = kspace_display.max()
-
-        if max_value > 0:
-            kspace_display = kspace_display / max_value
-
-        kspace_volume = kspace_display.permute(2, 1, 0).float()
-
-        return MRzeroReconstructLogic.make_sitk_image(
-            kspace_volume,
-            spacing=(1.0, 1.0, 1.0),
-            direction=(
-                1.0, 0.0, 0.0,
-                0.0, 1.0, 0.0,
-                0.0, 0.0, 1.0
-            ),
-            center_volume=True
-        )
-        
-    @staticmethod
-    def center_origin(sitk_img):
-        if sitk is None:
-            raise RuntimeError("SimpleITK is required for image conversion.")
-        spacing = np.array(sitk_img.GetSpacing())
-        direction = np.array(sitk_img.GetDirection()).reshape(3, 3)
-        size = np.array(sitk_img.GetSize(), dtype=float)
-        size_mm = size * spacing
-        half_size = 0.5 * size_mm
-        # Adjust origin so that (0,0,0) is at the physical center of the volume,
-        # accounting for the fact that the origin in SimpleITK is the center of the first voxel
-        origin = tuple(-direction @ (half_size - 0.5 * spacing))
-        sitk_img.SetOrigin(origin)
-        return sitk_img
+    def kspace_to_sitk(kspace: torch.Tensor) -> sitk.Image:
+        """Multi-coil k-space -> log-compressed RSS display volume (centred, unit spacing)."""
+        return reco_utils.kspace_to_sitk(kspace, center_volume=True)
 
     @staticmethod
-    def make_sitk_image(
-        volume: torch.Tensor,
-        spacing: tuple = (1.0, 1.0, 1.0),
-        origin: tuple = (0.0, 0.0, 0.0),
-        direction: tuple = (-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
-        center_volume: bool = True):
-        if sitk is None:
-            raise RuntimeError("SimpleITK is required for image conversion.")
-        """
-        Convert a torch tensor to SimpleITK image with centered origin.
-        Assumes volume shape is [Z, Y, X] or compatible.
-        """
-        data = volume.detach().cpu().numpy().astype(np.float32)
-        # Convert to sitk image with spatial orientation and origin
-        sitk_img = sitk.GetImageFromArray(data)
+    def center_origin(sitk_img: sitk.Image) -> sitk.Image:
+        """Put physical (0, 0, 0) at the centre of the volume."""
+        return reco_utils.center_origin(sitk_img)
 
-        sitk_img.SetSpacing(spacing)
-        sitk_img.SetDirection(direction)
-        if center_volume:
-            sitk_img = MRzeroReconstructLogic.center_origin(sitk_img)
-        else:
-            sitk_img.SetOrigin(origin)
+    @staticmethod
+    def make_sitk_image(volume: torch.Tensor,
+                        spacing: Sequence[float] = (1.0, 1.0, 1.0),
+                        origin: Sequence[float] = (0.0, 0.0, 0.0),
+                        direction: Sequence[float] = reco_utils.IDENTITY_DIRECTION,
+                        center_volume: bool = False) -> sitk.Image:
+        """Real ``[z, y, x]`` tensor -> float32 SimpleITK image."""
+        return reco_utils.make_sitk_image(volume, spacing=spacing, origin=origin,
+                                          direction=direction, center_volume=center_volume)
 
-        return sitk_img
+    # ================================================================
+    # MAIN RECONSTRUCTION
+    # ================================================================
 
     def runReconstruction(
         self,
-        signalPath,
-        sequencePath,
-        method,
-        kernelSize=(4, 1, 5),
-        reg=1e-4,
-        tol=0.1,
-        reg_cs=0.1,
-        reference_scan='mode',
-        signalPathRef=None,
-        gaussian_noise_factor=0.,
-        doRemoveNavigator=True,
+        signalPath: str,
+        sequencePath: str,
+        method: str = "FFT",
+        kernelSize: Sequence[int] = (4, 1, 5),
+        reg: float = 1e-4,
+        tol: float = 0.1,
+        reg_cs: float = 0.1,
+        reference_scan: str = "mode",
+        signalPathRef: Optional[str] = None,
+        gaussian_noise_factor: float = 0.0,
+        doRemoveNavigator: bool = True,
+        af: Optional[Sequence[int]] = None,
     ):
-        if sequencePath.endswith('.seq'):
-            if mr0 is None:
-                raise RuntimeError("MRzeroCore is required to load .seq files.")
-            seq0 = mr0.Sequence.import_file(
-                sequencePath.replace('\\\\', '\\')
+        """Reconstruct one simulated signal.
+
+        Args:
+            signalPath: ``.npy`` simulated signal ``[n_samples, ncoils]``.
+            sequencePath: ``.seq`` or ``.pkl`` MRzero sequence used for the
+                simulation.
+            method: ``"FFT"``, ``"GRAPPA"`` or ``"Zero-filled"``
+                (case-insensitive).
+            kernelSize: GRAPPA kernel ``(ky, kz, kx)``.
+            reg: GRAPPA Tikhonov regularisation.
+            tol: Zero-filled: relative tolerance on the recovery duration.
+            reg_cs: Zero-filled: L1-wavelet regularisation.
+            reference_scan: Zero-filled: reference duration, ``"mode"`` or
+                ``"min"``.
+            signalPathRef: optional reference signal whose maximum sets the
+                noise level; defaults to the signal itself.
+            gaussian_noise_factor: noise standard deviation relative to the
+                maximum of the reference signal (0 = no noise).
+            doRemoveNavigator: discard navigator blocks
+                (:meth:`RecoMRzero.remove_navigator`).
+            af: GRAPPA acceleration ``(af_y, af_z)``; ``None`` = estimated.
+
+        Returns:
+            ``(image_sitk, reconstruction_kspace_sitk, raw_kspace_sitk)``:
+            the magnitude image (RSS over coils, physical spacing in mm,
+            centred on the origin), the k-space corresponding to that image
+            and the gridded raw k-space, both as log-magnitude display
+            volumes.
+        """
+        method_key = method.strip().upper()
+        if method_key not in {m.upper() for m in METHODS}:
+            raise ValueError(
+                f"Unknown reconstruction method: {method}. "
+                f"Available methods: {', '.join(METHODS)}."
             )
 
-        elif sequencePath.endswith('.pkl'):
-            import pickle
+        reco = RecoMRzero(load_sequence(sequencePath))
 
-            with open(sequencePath, 'rb') as f:
-                seq0 = pickle.load(f)
-
-        else:
-            raise ValueError("Unsupported sequence file format")
-
-        reco = RecoMRzero(seq0)
-
-        # Load signal
         signal_np = np.load(signalPath)
-        if signalPathRef is not None and gaussian_noise_factor>0.:
-            signal_ref_np = np.load(signalPathRef)
-            # add gaussian noise with std equal to the maximum * gaussian_noise_factor
-            signal_np= self.add_gaussian_noise(signal_np, signal_ref_np, gaussian_noise_factor)
+        if gaussian_noise_factor > 0.0:
+            signal_ref_np = np.load(signalPathRef) if signalPathRef is not None else signal_np
+            signal_np = self.add_gaussian_noise(signal_np, signal_ref_np, gaussian_noise_factor)
+        signal = torch.from_numpy(np.asarray(signal_np))
 
-        signal = torch.from_numpy(signal_np)
-
-        # ============================================================
-        # RAW CARTESIAN K-SPACE
-        # ============================================================
+        # ------------------------------------------------------------
+        # Raw Cartesian k-space
+        # ------------------------------------------------------------
         if doRemoveNavigator:
             reco.remove_navigator()
-
-
-        raw_kspace, kx_vals, ky_vals, kz_vals = reco.cartesian_kspace_grid(
-            signal
-        )
-
-        # This is the original k-space before reconstruction processing
+        raw_kspace, _, _, _ = reco.cartesian_kspace_grid(signal)
         raw_kspace_sitk = self.kspace_to_sitk(raw_kspace)
 
-        # ============================================================
-        # RECONSTRUCTION
-        # ============================================================
+        # ------------------------------------------------------------
+        # Reconstruction
+        # ------------------------------------------------------------
+        if method_key == "FFT":
+            reconstruction_kspace, _ = reco.center_kspace(raw_kspace)
+            output = reco.fft_reconstruct(reconstruction_kspace)
 
-        if method == "FFT":
-
-            # Processed k-space used by the FFT
-            reconstruction_kspace = reco.pad_kspace_to_center(
-                raw_kspace,
-                kx_vals,
-                ky_vals,
-                kz_vals
+        elif method_key == "GRAPPA":
+            kspace, center = reco.center_kspace(raw_kspace)
+            acs = reco.get_acs_from_kspace(kspace, center)
+            reconstruction_kspace = reco.grappa_reconstruct(
+                kspace, acs, af=af, kernel_size=kernelSize, reg=reg
             )
+            output = reco.fft_reconstruct(reconstruction_kspace)
 
-            # Final reconstruction
-            output = reco.fft_reconstruct(
-                reconstruction_kspace
-            )
-
-        elif method == "GRAPPA":
-
-            # Processed k-space before GRAPPA
-            reconstruction_kspace = reco.pad_kspace_to_center(
-                raw_kspace,
-                kx_vals,
-                ky_vals,
-                kz_vals
-            )
-
-            # Extract ACS
-            acs = reco.get_acs_from_kspace(
-                reconstruction_kspace
-            )
-
-            # GRAPPA reconstruction
-            output = reco.grappa_reconstruct(
-                reconstruction_kspace,
-                acs,
-                kernel_size=kernelSize,
-                reg=reg
-            )
-
-            # GRAPPA returns the reconstructed image.
-            # Recover the corresponding k-space for visualization.
-            if output.dim() >= 3:
-                reconstruction_kspace = torch.fft.fftn(
-                    output,
-                    dim=tuple(range(output.dim() - 1))
-                    if output.dim() == 4
-                    else tuple(range(output.dim()))
-                )
-
-        elif method == "Zero-filled":
-
+        else:  # "ZERO-FILLED"
             output = reco.zero_filled_cs(
                 raw_kspace,
-                kx_vals,
-                ky_vals,
-                kz_vals,
                 tolerance=tol,
                 regularization=reg_cs,
-                reference_scan=reference_scan
+                reference_scan=reference_scan,
             )
+            # K-space consistent with the coil-combined CS image.
+            reconstruction_kspace = reco_utils.centered_fft(output, dims=(0, 1, 2))
 
-            # Zero-filled CS returns an image-domain result.
-            # Convert the complex reconstructed image back to k-space
-            # so that the displayed k-space corresponds to the output.
-            if output.dim() == 4:
-                reconstruction_kspace = torch.fft.fftn(
-                    output,
-                    dim=(0, 1, 2)
-                )
-            else:
-                reconstruction_kspace = torch.fft.fftn(
-                    output,
-                    dim=tuple(range(output.dim()))
-                )
-
-        else:
-            raise NotImplementedError(
-                f"Unknown reconstruction method: {method}"
-            )
-
-        # ============================================================
-        # RECONSTRUCTED IMAGE
-        # ============================================================
-
-        if output.dim() == 2:
-            magnitude = output.abs().unsqueeze(-1)
-
-        elif output.dim() == 4:
-            magnitude = output.abs().mean(dim=-1)
-
-        else:
-            magnitude = output.abs()
-        
-        if reconstruction_kspace.dim() == 3:
-            reconstruction_kspace = reconstruction_kspace.unsqueeze(-1)
-
-        sitk_volume = magnitude.permute(2, 1, 0)
-
+        # ------------------------------------------------------------
+        # Coil combination and conversion
+        # ------------------------------------------------------------
+        magnitude = reco_utils.rss(output, dim=-1) if output.dim() == 4 else output.abs()
         image_sitk = self.make_sitk_image(
-            sitk_volume,
-            spacing=reco.get_spacing()
+            magnitude.permute(2, 1, 0),
+            spacing=reco.get_spacing(magnitude.shape),
+            direction=IMAGE_DIRECTION,
+            center_volume=True,
         )
+        reconstruction_kspace_sitk = self.kspace_to_sitk(reconstruction_kspace)
 
-        # ============================================================
-        # RECONSTRUCTION K-SPACE
-        # ============================================================
+        return image_sitk, reconstruction_kspace_sitk, raw_kspace_sitk
 
-        reconstruction_kspace_sitk = self.kspace_to_sitk(
-            reconstruction_kspace
-        )
+    # ================================================================
+    # MULTIPLE-FILE RECONSTRUCTION
+    # ================================================================
 
-        return (
-            image_sitk,
-            reconstruction_kspace_sitk,
-            raw_kspace_sitk
-        )
+    def runMultipleReconstructions(self, signalPaths, sequencePath, method="FFT", **kwargs):
+        """Run :meth:`runReconstruction` on several signals with one sequence.
+
+        Extra keyword arguments are forwarded to :meth:`runReconstruction`.
+        Errors are caught per file.
+
+        Returns:
+            list of ``{"filename", "result", "error"}`` dicts, where ``result``
+            is the tuple returned by :meth:`runReconstruction` (or None) and
+            ``error`` the error message (or None).
+        """
+        results = []
+        for signalPath in signalPaths:
+            try:
+                result = self.runReconstruction(signalPath, sequencePath, method, **kwargs)
+                results.append({"filename": signalPath, "result": result, "error": None})
+            except Exception as exc:  # keep going with the other files
+                results.append({"filename": signalPath, "result": None, "error": str(exc)})
+        return results

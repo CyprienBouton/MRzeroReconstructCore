@@ -4,17 +4,39 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mrzero-reconstruct-core"
-version = "0.1.0"
-description = "Standalone MRzero reconstruction core with GRAPPA, BART bindings, and reconstruction logic."
+dynamic = ["version"]
+description = "Reconstruction core for MRzero simulated MRI signals (FFT, GRAPPA, wavelet-regularized compressed sensing), used by the 3D Slicer extension MRzeroReconstruct."
 readme = "README.md"
+# 3D Slicer 5.8 ships Python 3.9.
 requires-python = ">=3.9"
 dependencies = [
-    "numpy",
-    "torch",
-    "SimpleITK",
-    "mrzerocore",
-    "typing",
+    "numpy>=1.22",
+    "torch>=1.12",          # torch.fft, Tensor.H (vendored ggrappa)
+    "scipy>=1.7",           # imported by the vendored ggrappa
+    "tqdm>=4.60",           # progress bars of the vendored ggrappa
+    "SimpleITK>=2.1",
+    "mri-nufft[finufft]>=1.2; python_version >= '3.10'",
+    # Sequence loading (.seq import, unpickling .pkl). Uses only the stable
+    # Sequence / Repetition API (get_kspace, pulse.angle, event_time,
+    # adc_usage): tested with 0.4.1 (Python 3.9, Slicer 5.8), API checked
+    # against 1.6.1. mrzerocore >= 1.0 requires Python >= 3.10.
+    "mrzerocore>=0.4",
 ]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Source = "https://github.com/CyprienBouton/MRzeroReconstructCore"
+
+[tool.setuptools.dynamic]
+version = { attr = "MRzeroReconstructCoreLib.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["MRzeroReconstructCoreLib*"]
+
+[tool.setuptools.package-data]
+"MRzeroReconstructCoreLib.ggrappa" = ["LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

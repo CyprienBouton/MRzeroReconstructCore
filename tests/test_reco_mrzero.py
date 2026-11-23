@@ -1,0 +1,101 @@
+"""Tests of RecoMRzero gridding on a fake sequence (MRzeroCore not required)."""
+
+import torch
+
+from MRzeroReconstructCoreLib import RecoMRzero, reco_utils
+from phantom import make_phantom, relative_error
+
+DK = 1 / 0.2  # k-space step [1/m] -> 200 mm field of view
+
+
+class FakeSequence(list):
+    """Minimal stand-in for MRzeroCore.Sequence: only get_kspace() is used."""
+
+    def __init__(self, kspace_coords):
+        super().__init__()
+        self._coords = kspace_coords
+
+    def get_kspace(self):
+        return self._coords
+
+
+def _cartesian_coords(iy_range, nx=32, nz=4):
+    """ADC sample coordinates [n, 4] in 1/m, readout fastest, k=0 at n // 2."""
+    ix, iy, iz = torch.meshgrid(torch.arange(nx), torch.tensor(list(iy_range)),
+                                torch.arange(nz), indexing="ij")
+    coords = torch.stack([(ix - nx // 2) * DK, (iy - 16) * DK, (iz - nz // 2) * DK,
+                          torch.zeros_like(ix, dtype=torch.float32)], dim=-1)
+    return coords.reshape(-1, 4).float(), (ix.reshape(-1), iy.reshape(-1), iz.reshape(-1))
+
+
+def test_grid_and_fft_reproduce_phantom():
+    images, kspace = make_phantom()
+    coords, (ix, iy, iz) = _cartesian_coords(range(32))
+    signal = kspace[ix, iy, iz]                      # [n_samples, ncoils]
+    reco = RecoMRzero(FakeSequence(coords))
+    grid, *_ = reco.cartesian_kspace_grid(signal)
+    assert torch.allclose(grid, kspace)
+    centered, center = reco.center_kspace(grid)
+    assert center == (16, 16, 2)
+    assert relative_error(reco.fft_reconstruct(centered), images) < 1e-5
+    spacing = reco.get_spacing(centered.shape)
+    assert all(abs(s - expected) < 1e-3 for s, expected in zip(spacing, (6.25, 6.25, 50.0)))
+
+
+def test_partial_fourier_grid_is_padded_not_cropped():
+    _, kspace = make_phantom()
+    coords, (ix, iy, iz) = _cartesian_coords(range(10, 32))   # lines 10..31 acquired
+    reco = RecoMRzero(FakeSequence(coords))
+    grid, *_ = reco.cartesian_kspace_grid(kspace[ix, iy, iz])
+    assert grid.shape[1] == 22 and reco.kspace_center[1] == 6
+    centered, center = reco.center_kspace(grid)
+    assert centered.shape[1] == 32 and center[1] == 16
+    assert torch.allclose(centered[:, 10:], kspace[:, 10:])   # no sample lost
+
+
+def test_navigator_samples_are_dropped_from_signal():
+    _, kspace = make_phantom()
+    coords, (ix, iy, iz) = _cartesian_coords(range(32))
+    signal = kspace[ix, iy, iz]
+    extra = torch.ones(5, signal.shape[1], dtype=signal.dtype)
+    reco = RecoMRzero(FakeSequence(coords))
+    reco.signal_keep_mask = torch.cat([torch.ones(len(signal), dtype=torch.bool),
+                                       torch.zeros(5, dtype=torch.bool)])
+    grid, *_ = reco.cartesian_kspace_grid(torch.cat([signal, extra]))
+    assert torch.allclose(grid, kspace)
+
+
+def test_grappa_through_reco_class():
+    images, kspace = make_phantom()
+    lines = [y for y in range(32) if y % 2 == 0 or 10 <= y < 22]
+    coords, (ix, iy, iz) = _cartesian_coords(lines)
+    reco = RecoMRzero(FakeSequence(coords))
+    grid, *_ = reco.cartesian_kspace_grid(kspace[ix, iy, iz])
+    centered, center = reco.center_kspace(grid)
+    acs = reco.get_acs_from_kspace(centered, center)
+    filled = reco.grappa_reconstruct(centered, acs, kernel_size=(4, 1, 5), cuda=False)
+    error = relative_error(reco_utils.rss(reco.fft_reconstruct(filled)),
+                           reco_utils.rss(images))
+    assert error < 0.1, error
+
+
+def test_zero_filled_cs_rejects_irregular_recovery_line(monkeypatch):
+    # Odd readout and a single partition also exercise Haar boundary handling.
+    nx, ny, nz = 9, 32, 1
+    coords, _ = _cartesian_coords(range(ny), nx=nx, nz=nz)
+    kspace = torch.zeros((nx, ny, nz, 2), dtype=torch.complex64)
+    kspace[nx // 2, ny // 2, 0] = torch.tensor([1, 1j])
+    kspace[:, 2, 0] = 100
+    durations = torch.ones((ny, nz))
+    durations[2] = 2
+
+    reco = RecoMRzero(FakeSequence(coords))
+    grid, *_ = reco.cartesian_kspace_grid(kspace.reshape(-1, 2))
+    monkeypatch.setattr(reco, "get_inter_scan_duration", lambda: durations)
+
+    image = reco.zero_filled_cs(grid, regularization=0)
+    regularized = reco.zero_filled_cs(grid, regularization=0.1)
+    expected = torch.full_like(image.abs(), (2 / (nx * ny * nz)) ** 0.5)
+    assert image.shape == (nx, ny, nz)
+    torch.testing.assert_close(image.abs(), expected, atol=1e-6, rtol=1e-5)
+    assert 0 < regularized.norm() < image.norm()
