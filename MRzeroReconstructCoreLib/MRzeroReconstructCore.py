@@ -100,6 +100,8 @@ class MRzeroReconstructLogic:
         gaussian_noise_factor: float = 0.0,
         doRemoveNavigator: bool = True,
         af: Optional[Sequence[int]] = None,
+        nufft_shape: Sequence[int] = (128, 128, 1),
+        nufft_fov: Sequence[float] = (0.2, 0.2, 0.005),
     ):
         """Reconstruct one simulated signal.
 
@@ -121,6 +123,8 @@ class MRzeroReconstructLogic:
                 maximum of the reference signal (0 = no noise).
             doRemoveNavigator: discard navigator blocks
                 (:meth:`RecoMRzero.remove_navigator`).
+            nufft_shape: NUFFT image dimensions (x, y, z).
+            nufft_fov: NUFFT field of view (x, y, z) in metres, matching simulation.
             af: GRAPPA acceleration ``(af_y, af_z)``; ``None`` = estimated.
 
         Returns:
@@ -150,37 +154,40 @@ class MRzeroReconstructLogic:
         # ------------------------------------------------------------
         if doRemoveNavigator:
             reco.remove_navigator()
-        raw_kspace, _, _, _ = reco.cartesian_kspace_grid(signal)
-        raw_kspace_sitk = self.kspace_to_sitk(raw_kspace)
-
-        # ------------------------------------------------------------
-        # Reconstruction
-        # ------------------------------------------------------------
-        if method_key == "FFT":
-            reconstruction_kspace, _ = reco.center_kspace(raw_kspace)
-            output = reco.fft_reconstruct(reconstruction_kspace)
-
-        elif method_key == "GRAPPA":
-            kspace, center = reco.center_kspace(raw_kspace)
-            acs = reco.get_acs_from_kspace(kspace, center)
-            reconstruction_kspace = reco.grappa_reconstruct(
-                kspace, acs, af=af, kernel_size=kernelSize, reg=reg
-            )
-            output = reco.fft_reconstruct(reconstruction_kspace)
-
-        elif method_key == "NUFFT":
-            output = reco.nufft_reconstruct(signal)
+        if method_key == "NUFFT":
+            output = reco.nufft_reconstruct(signal, nufft_shape, nufft_fov)
             reconstruction_kspace = reco_utils.centered_fft(output)
+            # Nonuniform samples have no Cartesian raw volume. Display their
+            # reconstructed Cartesian spectrum in this API's third volume.
+            raw_kspace_sitk = self.kspace_to_sitk(reconstruction_kspace)
+        else:
+            raw_kspace, _, _, _ = reco.cartesian_kspace_grid(signal)
+            raw_kspace_sitk = self.kspace_to_sitk(raw_kspace)
 
-        else:  # "ZERO-FILLED"
-            output = reco.zero_filled_cs(
-                raw_kspace,
-                tolerance=tol,
-                regularization=reg_cs,
-                reference_scan=reference_scan,
-            )
-            # K-space consistent with the coil-combined CS image.
-            reconstruction_kspace = reco_utils.centered_fft(output, dims=(0, 1, 2))
+            # ------------------------------------------------------------
+            # Reconstruction
+            # ------------------------------------------------------------
+            if method_key == "FFT":
+                reconstruction_kspace, _ = reco.center_kspace(raw_kspace)
+                output = reco.fft_reconstruct(reconstruction_kspace)
+
+            elif method_key == "GRAPPA":
+                kspace, center = reco.center_kspace(raw_kspace)
+                acs = reco.get_acs_from_kspace(kspace, center)
+                reconstruction_kspace = reco.grappa_reconstruct(
+                    kspace, acs, af=af, kernel_size=kernelSize, reg=reg
+                )
+                output = reco.fft_reconstruct(reconstruction_kspace)
+
+            else:  # "ZERO-FILLED"
+                output = reco.zero_filled_cs(
+                    raw_kspace,
+                    tolerance=tol,
+                    regularization=reg_cs,
+                    reference_scan=reference_scan,
+                )
+                # K-space consistent with the coil-combined CS image.
+                reconstruction_kspace = reco_utils.centered_fft(output, dims=(0, 1, 2))
 
         # ------------------------------------------------------------
         # Coil combination and conversion

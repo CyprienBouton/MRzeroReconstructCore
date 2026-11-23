@@ -239,6 +239,12 @@ class RecoMRzero:
             int(self.iz[kz_rounded.abs().argmin()]),
         )
 
+        grid_bytes = self.nx * self.ny * self.nz * self.ncoils * torch.empty((), dtype=dtype).element_size()
+        if grid_bytes > 2 * 1024 ** 3:
+            raise ValueError(
+                "Inferred Cartesian grid exceeds 2 GiB. For radial or spiral "
+                "trajectories select NUFFT and specify image dimensions and field of view."
+            )
         grid = torch.zeros((self.nx, self.ny, self.nz, self.ncoils), dtype=dtype, device=device)
         grid.index_put_((self.ix, self.iy, self.iz), signal.to(dtype=dtype, device=device),
                         accumulate=True)
@@ -258,34 +264,47 @@ class RecoMRzero:
     # RECONSTRUCTION BACK-ENDS
     # ================================================================
 
-    def nufft_reconstruct(self, signal: torch.Tensor) -> torch.Tensor:
-        """Density-compensated adjoint NUFFT on the inferred Cartesian image grid.
+    def nufft_reconstruct(self, signal: torch.Tensor, shape=(128, 128, 1),
+                          fov=(0.2, 0.2, 0.005)) -> torch.Tensor:
+        """Density-compensated adjoint NUFFT using exact coordinates [1/m].
 
-        Uses exact sequence coordinates, with field of view inferred from the
-        Cartesian k-space steps. Call cartesian_kspace_grid first.
+        Shape is (x, y, z). Field of view is in metres and must match the
+        simulation. Singleton axes have zero trajectory coordinates.
         """
         from torchkbnufft import KbNufftAdjoint, calc_density_compensation_function
 
-        if self.ix is None:
-            raise RuntimeError("Call cartesian_kspace_grid() first.")
+        if len(shape) != 3 or any(int(n) != n or n < 1 for n in shape):
+            raise ValueError("NUFFT shape must contain three positive integers.")
+        shape = tuple(int(n) for n in shape)
+        if len(fov) != 3 or any(not np.isfinite(f) or f <= 0 for f in fov):
+            raise ValueError("NUFFT field of view must contain three positive lengths in metres.")
+        if np.prod(shape, dtype=float) > 256 ** 3:
+            raise ValueError("NUFFT image grid exceeds 256^3 voxels. Reduce its dimensions.")
         if signal.ndim == 1:
             signal = signal[:, None]
         coords = self.seq0.get_kspace()[:, :3].to(signal.device)
         if len(signal) != len(coords) and self.signal_keep_mask is not None:
             signal = signal[self.signal_keep_mask.to(signal.device)]
-        if len(signal) != len(coords):
-            raise ValueError("Signal and trajectory sample counts differ.")
-        shape = self.center_kspace(torch.zeros(
-            (self.nx, self.ny, self.nz), device=signal.device))[0].shape
+        if len(signal) != len(coords) or len(coords) == 0:
+            raise ValueError("Signal and trajectory must have equal, nonzero sample counts.")
+        if not torch.isfinite(coords).all() or not torch.isfinite(signal).all():
+            raise ValueError("Signal and trajectory must be finite.")
         axes = [axis for axis, size in enumerate(shape) if size > 1]
+        if len(axes) < 2:
+            raise ValueError("NUFFT requires at least two image dimensions greater than one.")
+        for axis, size in enumerate(shape):
+            if size == 1 and coords[:, axis].abs().max() > 1e-3:
+                raise ValueError("A singleton NUFFT axis has nonzero k-space coordinates.")
         sizes = tuple(shape[axis] for axis in axes)
-        steps = (self.dx, self.dy, self.dz)
-        omega = torch.stack([2 * torch.pi * coords[:, axis] / float(steps[axis]) / shape[axis]
+        omega = torch.stack([2 * torch.pi * coords[:, axis] * fov[axis] / shape[axis]
                              for axis in axes]).to(torch.float32)
+        if omega.abs().max() > torch.pi * 1.001:
+            raise ValueError("Trajectory exceeds the NUFFT grid bandwidth. Increase image dimensions.")
         adjoint = KbNufftAdjoint(im_size=sizes).to(signal.device)
         weights = calc_density_compensation_function(omega, im_size=sizes)
         samples = signal.T[None].to(torch.complex64)
         image = adjoint(samples * weights, omega, norm="ortho")[0]
+        self.dx, self.dy, self.dz = (1 / f for f in fov)
         return image.movedim(0, -1).reshape(*shape, signal.shape[-1])
 
     def fft_reconstruct(self, kspace: torch.Tensor) -> torch.Tensor:

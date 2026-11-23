@@ -26,7 +26,7 @@ extension installs it from this GitHub repository with `slicer.util.pip_install`
 | `method` | What it does | Needs |
 |---|---|---|
 | `"FFT"` | Zero-pads k-space so that k = 0 is centred, then applies a unitary centred inverse FFT. | — |
-| `"NUFFT"` | Density-compensated adjoint NUFFT using exact sample coordinates, on the image grid and field of view inferred by Cartesian gridding. | torchkbnufft |
+| `"NUFFT"` | Density-compensated adjoint NUFFT directly from exact sample coordinates, with explicit image dimensions and field of view. | torchkbnufft |
 | `"GRAPPA"` | Calibrates a GRAPPA kernel on the fully sampled centre (ACS) and fills the missing lines (vendored `ggrappa`). The acceleration is detected from the sampling pattern unless `af` is given. | — (GPU used when available) |
 | `"Zero-filled"` | For inversion-recovery sequences: zeroes the lines acquired with an irregular recovery time, then reconstructs with L1-wavelet compressed sensing. | — |
 
@@ -200,6 +200,12 @@ The tests use a synthetic multi-coil phantom and a fake sequence.
 
 The NUFFT method uses `torchkbnufft` for compatibility with Slicer Python 3.9.
 It weights samples for their sampling density before applying the adjoint
-nonuniform Fourier transform and combining coil magnitudes. Its geometry
-currently relies on Cartesian grid inference. General radial and spiral
-acquisitions require explicit geometry support before use.
+nonuniform Fourier transform and combining coil magnitudes. It bypasses
+Cartesian gridding for radial and spiral acquisitions.
+
+Set `nufft_shape=(nx, ny, nz)` and `nufft_fov=(fx, fy, fz)` in metres to
+match the simulation. Defaults are `(128, 128, 1)` and
+`(0.2, 0.2, 0.005)`. Slicer's NUFFT geometry controls accept field of view
+in millimetres. A singleton axis requires zero trajectory coordinates.
+For NUFFT the third returned display volume contains the reconstructed
+Cartesian spectrum, since nonuniform raw samples have no Cartesian grid.

@@ -99,3 +99,50 @@ def test_zero_filled_cs_rejects_irregular_recovery_line(monkeypatch):
     assert image.shape == (nx, ny, nz)
     torch.testing.assert_close(image.abs(), expected, atol=1e-6, rtol=1e-5)
     assert 0 < regularized.norm() < image.norm()
+
+
+def test_radial_nufft_through_slicer_entry_point(tmp_path, monkeypatch):
+    import importlib
+    import numpy as np
+    import SimpleITK as sitk
+    from torchkbnufft import KbNufft
+    from MRzeroReconstructCoreLib import MRzeroReconstructLogic
+
+    angles = torch.arange(48) * torch.pi / 48
+    radii = torch.linspace(-0.49, 0.49, 48)
+    trajectory = torch.stack((torch.cos(angles)[:, None] * radii,
+                              torch.sin(angles)[:, None] * radii)).reshape(2, -1)
+    shape = (32, 32, 1)
+    fov = (0.2, 0.2, 0.005)
+    coords = torch.zeros(trajectory.shape[1], 4)
+    coords[:, :2] = trajectory.T * 32 / 0.2
+    image = torch.zeros(1, 1, 32, 32, dtype=torch.complex64)
+    image[:, :, 12:20, 12:20] = 1
+    signal = KbNufft(im_size=(32, 32))(image, 2 * torch.pi * trajectory, norm="ortho")
+    path = tmp_path / "signal.npy"
+    np.save(path, signal[0].T.numpy())
+    module = importlib.import_module("MRzeroReconstructCoreLib.MRzeroReconstructCore")
+    monkeypatch.setattr(module, "load_sequence", lambda _: FakeSequence(coords))
+
+    def fail_gridding(*args, **kwargs):
+        raise AssertionError("NUFFT must bypass Cartesian gridding")
+
+    monkeypatch.setattr(RecoMRzero, "cartesian_kspace_grid", fail_gridding)
+    volumes = MRzeroReconstructLogic().runReconstruction(
+        path, "radial.seq", "NUFFT", doRemoveNavigator=False,
+        nufft_shape=shape, nufft_fov=fov)
+    reconstructed = torch.tensor(sitk.GetArrayFromImage(volumes[0])[0])
+    target = image[0, 0].abs().T
+    reconstructed *= (target * reconstructed).sum() / reconstructed.square().sum()
+    assert (target - reconstructed).norm() / target.norm() < 0.2
+    assert all(v.GetSize() == shape for v in volumes)
+    assert volumes[0].GetSpacing() == (6.25, 6.25, 5.0)
+
+
+def test_cartesian_grid_rejects_huge_inferred_grid():
+    import pytest
+    coords = torch.tensor([[0., 0., 0., 0.], [0.05, 0.05, 0.05, 0.],
+                           [1000., 1000., 1000., 0.]])
+    reco = RecoMRzero(FakeSequence(coords))
+    with pytest.raises(ValueError, match="select NUFFT"):
+        reco.cartesian_kspace_grid(torch.ones(3, 1, dtype=torch.complex64))
