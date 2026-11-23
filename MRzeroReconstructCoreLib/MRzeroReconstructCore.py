@@ -18,7 +18,7 @@ from . import reco_utils
 from .RecoMRzero import RecoMRzero
 
 #: Reconstruction methods accepted by ``runReconstruction`` (case-insensitive).
-METHODS = ("FFT", "GRAPPA", "Zero-filled")
+METHODS = ("FFT", "GRAPPA", "NUFFT", "Zero-filled")
 
 #: Orientation of reconstructed MRzero images (x axis flipped for Slicer's RAS display).
 IMAGE_DIRECTION = (-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
@@ -167,6 +167,10 @@ class MRzeroReconstructLogic:
                 kspace, acs, af=af, kernel_size=kernelSize, reg=reg
             )
             output = reco.fft_reconstruct(reconstruction_kspace)
+
+        elif method_key == "NUFFT":
+            output = reco.nufft_reconstruct(signal)
+            reconstruction_kspace = reco_utils.centered_fft(output)
 
         else:  # "ZERO-FILLED"
             output = reco.zero_filled_cs(

@@ -258,6 +258,36 @@ class RecoMRzero:
     # RECONSTRUCTION BACK-ENDS
     # ================================================================
 
+    def nufft_reconstruct(self, signal: torch.Tensor) -> torch.Tensor:
+        """Density-compensated adjoint NUFFT on the inferred Cartesian image grid.
+
+        Uses exact sequence coordinates, with field of view inferred from the
+        Cartesian k-space steps. Call cartesian_kspace_grid first.
+        """
+        from torchkbnufft import KbNufftAdjoint, calc_density_compensation_function
+
+        if self.ix is None:
+            raise RuntimeError("Call cartesian_kspace_grid() first.")
+        if signal.ndim == 1:
+            signal = signal[:, None]
+        coords = self.seq0.get_kspace()[:, :3].to(signal.device)
+        if len(signal) != len(coords) and self.signal_keep_mask is not None:
+            signal = signal[self.signal_keep_mask.to(signal.device)]
+        if len(signal) != len(coords):
+            raise ValueError("Signal and trajectory sample counts differ.")
+        shape = self.center_kspace(torch.zeros(
+            (self.nx, self.ny, self.nz), device=signal.device))[0].shape
+        axes = [axis for axis, size in enumerate(shape) if size > 1]
+        sizes = tuple(shape[axis] for axis in axes)
+        steps = (self.dx, self.dy, self.dz)
+        omega = torch.stack([2 * torch.pi * coords[:, axis] / float(steps[axis]) / shape[axis]
+                             for axis in axes]).to(torch.float32)
+        adjoint = KbNufftAdjoint(im_size=sizes).to(signal.device)
+        weights = calc_density_compensation_function(omega, im_size=sizes)
+        samples = signal.T[None].to(torch.complex64)
+        image = adjoint(samples * weights, omega, norm="ortho")[0]
+        return image.movedim(0, -1).reshape(*shape, signal.shape[-1])
+
     def fft_reconstruct(self, kspace: torch.Tensor) -> torch.Tensor:
         """Unitary centred inverse FFT over the three encoding axes.
 
