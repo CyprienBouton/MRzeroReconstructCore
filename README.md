@@ -204,8 +204,12 @@ nonuniform Fourier transform and combining coil magnitudes. It bypasses
 Cartesian gridding for radial and spiral acquisitions.
 
 Set `nufft_shape=(nx, ny, nz)` and `nufft_fov=(fx, fy, fz)` in metres to
-match the simulation. Defaults are `(128, 128, 1)` and
-`(0.2, 0.2, 0.005)`. Slicer's NUFFT geometry controls accept field of view
-in millimetres. A singleton axis requires zero trajectory coordinates.
+match the simulation. Defaults are `(128, 128, 1)` and automatic radial FOV estimation
+(`nufft_fov=None`). The estimate uses `FOV = 1 / Δk` from consecutive
+ADC samples within straight, uniformly spaced spokes through k=0.
+It measures the encoded sampling FOV, which includes readout oversampling.
+Singleton axes use nominal 5 mm thickness. Unsupported or inconsistent
+readouts require manual FOV entry. Slicer's NUFFT geometry controls accept field of view
+in millimetres, or blank for automatic estimation. A singleton axis requires zero trajectory coordinates.
 For NUFFT the third returned display volume contains the reconstructed
 Cartesian spectrum, since nonuniform raw samples have no Cartesian grid.

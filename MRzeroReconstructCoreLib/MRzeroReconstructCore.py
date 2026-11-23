@@ -101,7 +101,7 @@ class MRzeroReconstructLogic:
         doRemoveNavigator: bool = True,
         af: Optional[Sequence[int]] = None,
         nufft_shape: Sequence[int] = (128, 128, 1),
-        nufft_fov: Sequence[float] = (0.2, 0.2, 0.005),
+        nufft_fov: Optional[Sequence[float]] = None,
     ):
         """Reconstruct one simulated signal.
 
@@ -124,7 +124,8 @@ class MRzeroReconstructLogic:
             doRemoveNavigator: discard navigator blocks
                 (:meth:`RecoMRzero.remove_navigator`).
             nufft_shape: NUFFT image dimensions (x, y, z).
-            nufft_fov: NUFFT field of view (x, y, z) in metres, matching simulation.
+            nufft_fov: NUFFT field of view (x, y, z) in metres. None estimates
+                the sampling FOV from uniform radial readout spacing.
             af: GRAPPA acceleration ``(af_y, af_z)``; ``None`` = estimated.
 
         Returns:

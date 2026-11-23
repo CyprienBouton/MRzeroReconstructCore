@@ -146,3 +146,27 @@ def test_cartesian_grid_rejects_huge_inferred_grid():
     reco = RecoMRzero(FakeSequence(coords))
     with pytest.raises(ValueError, match="select NUFFT"):
         reco.cartesian_kspace_grid(torch.ones(3, 1, dtype=torch.complex64))
+
+
+def test_automatic_radial_fov_and_manual_equivalence():
+    from types import SimpleNamespace
+    import pytest
+
+    angles = torch.arange(16) * torch.pi / 16
+    radii = torch.arange(-16, 16) * 5.0  # 5 cycles/m -> 200 mm encoded FOV
+    coords = torch.zeros(16, 32, 4)
+    coords[..., 0] = torch.cos(angles)[:, None] * radii
+    coords[..., 1] = torch.sin(angles)[:, None] * radii
+    seq = FakeSequence(coords.reshape(-1, 4))
+    seq.extend(SimpleNamespace(adc_usage=torch.ones(32)) for _ in angles)
+    reco = RecoMRzero(seq)
+    assert reco.estimate_radial_fov((32, 32, 1)) == pytest.approx((0.2, 0.2, 0.005))
+    signal = torch.ones(16 * 32, 1, dtype=torch.complex64)
+    automatic = reco.nufft_reconstruct(signal, (32, 32, 1))
+    manual = reco.nufft_reconstruct(signal, (32, 32, 1), (0.2, 0.2, 0.005))
+    # Float trajectory roundoff can change NUFFT interpolation table bins.
+    assert (automatic - manual).norm() / manual.norm() < 1e-3
+    # Variable spacing requires an explicit field of view.
+    seq._coords[4, 0] += 1
+    with pytest.raises(ValueError, match="spacing varies"):
+        reco.estimate_radial_fov()

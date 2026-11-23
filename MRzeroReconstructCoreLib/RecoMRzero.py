@@ -264,8 +264,52 @@ class RecoMRzero:
     # RECONSTRUCTION BACK-ENDS
     # ================================================================
 
+    def estimate_radial_fov(self, shape=(128, 128, 1)):
+        """Estimate isotropic radial FOV from within-readout sample spacing.
+
+        Returns the encoded sampling FOV. Readout oversampling can make this
+        larger than the prescribed object FOV. Singleton axes use nominal
+        slice thickness because their thickness cannot be inferred from k-space.
+        """
+        coords = self.seq0.get_kspace()[:, :3].detach().cpu().double()
+        counts = [_adc_count(rep) for rep in self.seq0]
+        if sum(counts) != len(coords) or not counts:
+            raise ValueError("Automatic FOV needs ADC readout boundaries. Enter FOV manually.")
+        spacings = []
+        offset = 0
+        for rep, count in zip(self.seq0, counts):
+            readout = coords[offset:offset + count]
+            offset += count
+            if count < 3:
+                continue
+            # Avoid differences across unmeasured events within a repetition.
+            events = torch.nonzero(rep.adc_usage > 0).flatten().cpu()
+            delta = readout.diff(dim=0)
+            lengths = delta.norm(dim=1)
+            valid = (events.diff() == 1) & (lengths > 1e-8)
+            if not valid.any():
+                continue
+            direction = delta[valid][0] / lengths[valid][0]
+            # Constant steps and a line through k=0 identify a radial spoke.
+            perpendicular = readout - (readout @ direction)[:, None] * direction
+            if perpendicular.norm(dim=1).max() > max(float(readout.norm(dim=1).max()) * 1e-3, 1e-5):
+                raise ValueError("Automatic FOV supports straight radial spokes through k=0. Enter FOV manually.")
+            spacing = lengths[valid].median()
+            if ((lengths[valid] - spacing).abs() > 0.05 * spacing).any():
+                raise ValueError("Radial sample spacing varies. Enter FOV manually.")
+            spacings.append(spacing)
+        if not spacings:
+            raise ValueError("No radial readout has enough consecutive samples to estimate FOV.")
+        spacings = torch.stack(spacings)
+        spacing = spacings.median()
+        if ((spacings - spacing).abs() > 0.05 * spacing).any():
+            raise ValueError("Radial spokes have inconsistent spacing. Enter FOV manually.")
+        fov = float(1 / spacing)
+        return tuple(fov if size > 1 else self.DEFAULT_SINGLE_SLICE_THICKNESS
+                     for size in shape)
+
     def nufft_reconstruct(self, signal: torch.Tensor, shape=(128, 128, 1),
-                          fov=(0.2, 0.2, 0.005)) -> torch.Tensor:
+                          fov=None) -> torch.Tensor:
         """Density-compensated adjoint NUFFT using exact coordinates [1/m].
 
         Shape is (x, y, z). Field of view is in metres and must match the
@@ -276,6 +320,8 @@ class RecoMRzero:
         if len(shape) != 3 or any(int(n) != n or n < 1 for n in shape):
             raise ValueError("NUFFT shape must contain three positive integers.")
         shape = tuple(int(n) for n in shape)
+        if fov is None:
+            fov = self.estimate_radial_fov(shape)
         if len(fov) != 3 or any(not np.isfinite(f) or f <= 0 for f in fov):
             raise ValueError("NUFFT field of view must contain three positive lengths in metres.")
         if np.prod(shape, dtype=float) > 256 ** 3:
