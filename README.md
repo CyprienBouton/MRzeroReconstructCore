@@ -53,11 +53,13 @@ the same sequence API.
 or let the extension do it. Installing into your system Python does not make
 the package available inside Slicer.
 
-### Zero-filled dependencies
+### GPU calibration for compressed sensing
 
-Python 3.10 and later install [MRI-NUFFT](https://mind-inria.github.io/mri-nufft/)
-with the CPU FINUFFT backend for multi-coil calibration. On Python 3.9
-(3D Slicer 5.8), the calibration uses the equivalent Cartesian PyTorch FFT.
+On a system with CUDA 12, run `pip install '.[cufinufft]'` from the repository
+to install the [MRI-NUFFT cuFINUFFT backend](https://mind-inria.github.io/mri-nufft/install.html).
+With Python 3.10 or later and CUDA available to PyTorch, multi-coil calibration
+uses the cuFINUFFT adjoint on the GPU. The standard installation, CPU-only
+environments, and Python 3.9 (3D Slicer 5.8) use a centered Cartesian IFFT.
 The iterative reconstruction uses PyTorch on the input tensor's device.
 
 ## Quick start

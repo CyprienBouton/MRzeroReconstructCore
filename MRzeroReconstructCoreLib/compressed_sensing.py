@@ -2,6 +2,7 @@
 
 import math
 import sys
+from importlib.util import find_spec
 
 import torch
 
@@ -25,23 +26,29 @@ def _estimate_sensitivities(kspace, acquired, widths):
     if not calibration.any():
         raise ValueError("The central calibration window contains no acquired samples.")
 
-    if sys.version_info < (3, 10):
-        # Slicer's Python 3.9 can evaluate the same Cartesian adjoint via FFT.
-        coil_images = centered_ifft(kspace.masked_fill(~calibration[..., None], 0))
-    else:
+    if (
+        sys.version_info >= (3, 10)
+        and torch.cuda.is_available()
+        and find_spec("cufinufft") is not None
+    ):
         from mrinufft import get_operator
 
-        # MRI-NUFFT takes coordinates in cycles per voxel and coil-first data.
+        # MRI-NUFFT takes coordinates in cycles per voxel. Its cuFINUFFT
+        # backend uses single precision and expects batch, coil, sample order.
         indices = calibration.nonzero()
         sizes = indices.new_tensor(shape)
-        trajectory = ((indices - sizes // 2).to(kspace.real.dtype) / sizes).cpu().numpy()
-        samples = kspace[calibration].T.contiguous().detach().cpu().numpy()
-        operator = get_operator("finufft")(
-            trajectory, tuple(shape), n_coils=kspace.shape[-1], nthreads=1,
+        trajectory = ((indices - sizes // 2).to(torch.float32) / sizes).cpu().numpy()
+        samples = kspace[calibration].T.detach().to(
+            device="cpu", dtype=torch.complex64
+        ).contiguous().numpy()[None, ...]
+        operator = get_operator("cufinufft")(
+            trajectory, tuple(shape), n_coils=kspace.shape[-1],
         )
         coil_images = torch.as_tensor(
             operator.adj_op(samples), dtype=kspace.dtype, device=kspace.device,
         ).reshape(kspace.shape[-1], *shape).movedim(0, -1)
+    else:
+        coil_images = centered_ifft(kspace.masked_fill(~calibration[..., None], 0))
 
     magnitude = rss(coil_images)[..., None]
     floor = (magnitude.max() * torch.finfo(magnitude.dtype).eps).clamp_min(

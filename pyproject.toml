@@ -17,7 +17,6 @@ dependencies = [
     "scipy>=1.7",           # imported by the vendored ggrappa
     "tqdm>=4.60",           # progress bars of the vendored ggrappa
     "SimpleITK>=2.1",
-    "mri-nufft[finufft]>=1.2; python_version >= '3.10'",
     # Sequence loading (.seq import, unpickling .pkl). Uses only the stable
     # Sequence / Repetition API (get_kspace, pulse.angle, event_time,
     # adc_usage): tested with 0.4.1 (Python 3.9, Slicer 5.8), API checked
@@ -26,6 +25,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cufinufft = [
+    "mri-nufft>=1.2; python_version >= '3.10'",
+    "cufinufft>=2.4; python_version >= '3.10'",
+    "cupy-cuda12x; python_version >= '3.10'",
+]
 test = ["pytest>=7"]
 
 [project.urls]
